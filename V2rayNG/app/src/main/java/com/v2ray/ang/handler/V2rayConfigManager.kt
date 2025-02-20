@@ -54,145 +54,124 @@ import com.v2ray.ang.util.Utils
 object V2rayConfigManager {
 
     fun getV2rayConfig(context: Context, guid: String): ConfigResult {
-        try {
-            val config = MmkvManager.decodeServerConfig(guid) ?: return ConfigResult(false)
-            if (config.configType == EConfigType.CUSTOM) {
-                val raw = MmkvManager.decodeServerRaw(guid) ?: return ConfigResult(false)
-                val domainPort = config.getServerAddressAndPort()
-                return ConfigResult(true, guid, raw, domainPort)
-            }
+    try {
+        var config = MmkvManager.decodeServerConfig(guid)
+        if (config == null) {
+            config = getConfigFromJson(context) // โหลดจาก JSON ถ้าไม่มีใน MMKV
+            if (config == null) return ConfigResult(false)
+        }
 
-            val result = getV2rayNonCustomConfig(context, config)
-            //Log.d(ANG_PACKAGE, result.content)
-            result.guid = guid
+        if (config.configType == EConfigType.CUSTOM) {
+            val raw = MmkvManager.decodeServerRaw(guid) ?: return ConfigResult(false)
+            val domainPort = config.getServerAddressAndPort()
+            return ConfigResult(true, guid, raw, domainPort)
+        }
+
+        val result = getV2rayNonCustomConfig(context, config)
+        result.guid = guid
+        return result
+    } catch (e: Exception) {
+        e.printStackTrace()
+        return ConfigResult(false)
+    }
+}
+
+private fun getV2rayNonCustomConfig(context: Context, config: ProfileItem): ConfigResult {
+    val result = ConfigResult(false)
+
+    val address = config.server ?: return result
+    if (!Utils.isIpAddress(address)) {
+        if (!Utils.isValidUrl(address)) {
+            Log.d(ANG_PACKAGE, "$address is an invalid ip or domain")
             return result
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return ConfigResult(false)
         }
     }
 
-    private fun getV2rayNonCustomConfig(context: Context, config: ProfileItem): ConfigResult {
-        val result = ConfigResult(false)
-
-        val address = config.server ?: return result
-        if (!Utils.isIpAddress(address)) {
-            if (!Utils.isValidUrl(address)) {
-                Log.d(ANG_PACKAGE, "$address is an invalid ip or domain")
-                return result
-            }
-        }
-
-        //取得默认配置
-        val assets = Utils.readTextFromAssets(context, "v2ray_config.json")
-        if (TextUtils.isEmpty(assets)) {
-            return result
-        }
-        val v2rayConfig = JsonUtil.fromJson(assets, V2rayConfig::class.java) ?: return result
-        v2rayConfig.log.loglevel =
-            MmkvManager.decodeSettingsString(AppConfig.PREF_LOGLEVEL) ?: "warning"
-        v2rayConfig.remarks = config.remarks
-
-        inbounds(v2rayConfig)
-
-        val isPlugin = config.configType == EConfigType.HYSTERIA2
-        val retOut = outbounds(v2rayConfig, config, isPlugin) ?: return result
-        val retMore = moreOutbounds(v2rayConfig, config.subscriptionId, isPlugin)
-
-        routing(v2rayConfig)
-
-        fakedns(v2rayConfig)
-
-        dns(v2rayConfig)
-
-        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED) == true) {
-            customLocalDns(v2rayConfig)
-        }
-        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_SPEED_ENABLED) != true) {
-            v2rayConfig.stats = null
-            v2rayConfig.policy = null
-        }
-
-        result.status = true
-        result.content = v2rayConfig.toPrettyPrinting()
-        result.domainPort = if (retMore.first) retMore.second else retOut.second
+    val assets = Utils.readTextFromAssets(context, "v2ray_config.json")
+    if (TextUtils.isEmpty(assets)) {
         return result
     }
+    val v2rayConfig = JsonUtil.fromJson(assets, V2rayConfig::class.java) ?: return result
+    v2rayConfig.log.loglevel =
+        MmkvManager.decodeSettingsString(AppConfig.PREF_LOGLEVEL) ?: "warning"
+    v2rayConfig.remarks = config.remarks
 
-    private fun inbounds(v2rayConfig: V2rayConfig): Boolean {
-        try {
-            val socksPort = SettingsManager.getSocksPort()
-
-            v2rayConfig.inbounds.forEach { curInbound ->
-                if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PROXY_SHARING) != true) {
-                    //bind all inbounds to localhost if the user requests
-                    curInbound.listen = LOOPBACK
-                }
-            }
-            v2rayConfig.inbounds[0].port = socksPort
-            val fakedns = MmkvManager.decodeSettingsBool(AppConfig.PREF_FAKE_DNS_ENABLED) == true
-            val sniffAllTlsAndHttp =
-                MmkvManager.decodeSettingsBool(AppConfig.PREF_SNIFFING_ENABLED, true) != false
-            v2rayConfig.inbounds[0].sniffing?.enabled = fakedns || sniffAllTlsAndHttp
-            v2rayConfig.inbounds[0].sniffing?.routeOnly =
-                MmkvManager.decodeSettingsBool(AppConfig.PREF_ROUTE_ONLY_ENABLED, false)
-            if (!sniffAllTlsAndHttp) {
-                v2rayConfig.inbounds[0].sniffing?.destOverride?.clear()
-            }
-            if (fakedns) {
-                v2rayConfig.inbounds[0].sniffing?.destOverride?.add("fakedns")
-            }
-
-            if (Utils.isXray()) {
-                v2rayConfig.inbounds.removeAt(1)
-            } else {
-                val httpPort = SettingsManager.getHttpPort()
-                v2rayConfig.inbounds[1].port = httpPort
-            }
-
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return false
-        }
-        return true
+    // บันทึกเซิร์ฟเวอร์จาก JSON ลง MMKV ถ้ายังไม่มี
+    v2rayConfig.outbounds.forEach { outbound ->
+        val profileItem = ProfileItem(
+            configType = when (outbound.protocol) {
+                "vmess" -> EConfigType.VMESS
+                "vless" -> EConfigType.VLESS
+                else -> EConfigType.CUSTOM
+            },
+            server = outbound.settings?.vnext?.firstOrNull()?.address ?: "",
+            subscriptionId = "",
+            remarks = "Imported from JSON"
+        )
+        MmkvManager.encodeServerConfig(Utils.getUuid(), profileItem)
     }
 
-    private fun outbounds(v2rayConfig: V2rayConfig, config: ProfileItem, isPlugin: Boolean): Pair<Boolean, String>? {
-        if (isPlugin) {
-            val socksPort = Utils.findFreePort(listOf(100 + SettingsManager.getSocksPort(), 0))
-            val outboundNew = V2rayConfig.OutboundBean(
-                mux = null,
-                protocol = EConfigType.SOCKS.name.lowercase(),
-                settings = V2rayConfig.OutboundBean.OutSettingsBean(
-                    servers = listOf(
-                        V2rayConfig.OutboundBean.OutSettingsBean.ServersBean(
-                            address = LOOPBACK,
-                            port = socksPort
-                        )
+    inbounds(v2rayConfig)
+
+    val isPlugin = config.configType == EConfigType.HYSTERIA2
+    val retOut = outbounds(v2rayConfig, config, isPlugin) ?: return result
+    val retMore = moreOutbounds(v2rayConfig, config.subscriptionId, isPlugin)
+
+    routing(v2rayConfig)
+    fakedns(v2rayConfig)
+    dns(v2rayConfig)
+
+    if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED) == true) {
+        customLocalDns(v2rayConfig)
+    }
+    if (MmkvManager.decodeSettingsBool(AppConfig.PREF_SPEED_ENABLED) != true) {
+        v2rayConfig.stats = null
+        v2rayConfig.policy = null
+    }
+
+    result.status = true
+    result.content = v2rayConfig.toPrettyPrinting()
+    result.domainPort = if (retMore.first) retMore.second else retOut.second
+    return result
+}
+
+private fun outbounds(v2rayConfig: V2rayConfig, config: ProfileItem, isPlugin: Boolean): Pair<Boolean, String>? {
+    if (isPlugin) {
+        val socksPort = Utils.findFreePort(listOf(100 + SettingsManager.getSocksPort(), 0))
+        val outboundNew = V2rayConfig.OutboundBean(
+            mux = null,
+            protocol = EConfigType.SOCKS.name.lowercase(),
+            settings = V2rayConfig.OutboundBean.OutSettingsBean(
+                servers = listOf(
+                    V2rayConfig.OutboundBean.OutSettingsBean.ServersBean(
+                        address = LOOPBACK,
+                        port = socksPort
                     )
                 )
             )
-            if (v2rayConfig.outbounds.isNotEmpty()) {
-                v2rayConfig.outbounds[0] = outboundNew
-            } else {
-                v2rayConfig.outbounds.add(outboundNew)
-            }
-            return Pair(true, outboundNew.getServerAddressAndPort())
-        }
-
-        val outbound = getProxyOutbound(config) ?: return null
-        val ret = updateOutboundWithGlobalSettings(outbound)
-        if (!ret) return null
-
+        )
         if (v2rayConfig.outbounds.isNotEmpty()) {
-            v2rayConfig.outbounds[0] = outbound
+            v2rayConfig.outbounds.add(0, outboundNew) // เพิ่มเซิร์ฟเวอร์ แทนการเขียนทับ
         } else {
-            v2rayConfig.outbounds.add(outbound)
+            v2rayConfig.outbounds.add(outboundNew)
         }
-
-        updateOutboundFragment(v2rayConfig)
-        return Pair(true, config.getServerAddressAndPort())
+        return Pair(true, outboundNew.getServerAddressAndPort())
     }
+
+    val outbound = getProxyOutbound(config) ?: return null
+    val ret = updateOutboundWithGlobalSettings(outbound)
+    if (!ret) return null
+
+    if (v2rayConfig.outbounds.isNotEmpty()) {
+        v2rayConfig.outbounds.add(0, outbound) // เพิ่มเซิร์ฟเวอร์ แทนการเขียนทับ
+    } else {
+        v2rayConfig.outbounds.add(outbound)
+    }
+
+    updateOutboundFragment(v2rayConfig)
+    return Pair(true, config.getServerAddressAndPort())
+}
+
 
     private fun fakedns(v2rayConfig: V2rayConfig) {
         if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED) == true
